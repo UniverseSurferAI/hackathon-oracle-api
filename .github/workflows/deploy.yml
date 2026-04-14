@@ -30,20 +30,12 @@ jobs:
           docker build --platform linux/amd64 -t europe-west1-docker.pkg.dev/predictionpro-io/cloud-run-source-deploy/hackathon-oracle-api:${{ github.sha }} .
           docker push europe-west1-docker.pkg.dev/predictionpro-io/cloud-run-source-deploy/hackathon-oracle-api:${{ github.sha }}
       
-      - name: Check existing service
-        run: |
-          echo "Checking service status..."
-          gcloud run services describe hackathon-oracle-api --region=europe-west1 --format="value(status.url)" 2>&1 || echo "Service does not exist yet"
-      
       - name: Deploy to Cloud Run
         run: |
-          echo "Deploying with image: europe-west1-docker.pkg.dev/predictionpro-io/cloud-run-source-deploy/hackathon-oracle-api:${{ github.sha }}"
           gcloud run deploy hackathon-oracle-api \
             --image=europe-west1-docker.pkg.dev/predictionpro-io/cloud-run-source-deploy/hackathon-oracle-api:${{ github.sha }} \
             --region=europe-west1 \
             --platform=managed \
             --allow-unauthenticated \
-            --timeout=10m 2>&1
-          echo "Deployment complete!"
-          echo "Service URL:"
-          gcloud run services describe hackathon-oracle-api --region=europe-west1 --format="value(status.url)"
+            --update \
+            --quiet
