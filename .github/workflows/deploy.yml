@@ -32,10 +32,9 @@ jobs:
       
       - name: Deploy to Cloud Run
         run: |
-          gcloud run deploy hackathon-oracle-api \
+          gcloud beta run deploy hackathon-oracle-api \
             --image=europe-west1-docker.pkg.dev/predictionpro-io/cloud-run-source-deploy/hackathon-oracle-api:${{ github.sha }} \
             --region=europe-west1 \
             --platform=managed \
             --allow-unauthenticated \
-            --update \
             --quiet
