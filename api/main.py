@@ -13,6 +13,14 @@ from loguru import logger
 
 from api.fee_calculator import FeeCalculator
 from api.resolution import HackathonOracle
+from api.database import (
+    init_db, create_market, get_market, get_all_markets,
+    update_market_volume, resolve_market as db_resolve_market,
+    close_market_betting as db_close_market_betting,
+    record_fee, get_fee_history, register_webhook, get_webhooks
+)
+from api.webhooks import notifier
+from api.scraping import website_scraper
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -30,6 +38,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize database
+init_db()
+
 # Initialize fee calculator (2% on volume)
 fee_calculator = FeeCalculator(
     fee_percentage=2.0,
@@ -39,7 +50,7 @@ fee_calculator = FeeCalculator(
 # Initialize oracle
 oracle = HackathonOracle(fee_calculator)
 
-# In-memory storage (use database in production)
+# In-memory cache for quick access (backed by database)
 active_markets = {}
 fee_history = []
 
@@ -75,10 +86,22 @@ class MarketResponse(BaseModel):
     winner: Optional[str] = None
     fee_paid: bool
 
-class ResolveRequest(BaseModel):
-    """Request to manually resolve a market (admin only)"""
-    market_id: str
-    winner: str
+class RegisterWebhookRequest(BaseModel):
+    """Request to register a webhook"""
+    platform_id: str
+    url: str = Field(..., description="Webhook URL to receive notifications")
+    event_types: list[str] = Field(
+        default=["all"],
+        description="Event types to receive: market_created, market_resolved, betting_closed, winner_detected, all"
+    )
+
+class WebhookResponse(BaseModel):
+    """Response for webhook registration"""
+    webhook_id: int
+    platform_id: str
+    url: str
+    event_types: list[str]
+    message: str
 
 # ============================================================================
 # API ENDPOINTS
@@ -96,15 +119,12 @@ def read_root():
     }
 
 @app.post("/api/v1/markets", response_model=dict)
-def create_market(request: CreateMarketRequest):
+async def create_market_endpoint(request: CreateMarketRequest):
     """Create a new hackathon prediction market"""
     logger.info(f"Creating market: {request.market_id} for hackathon: {request.hackathon_name}")
     
     # Generate internal ID
     internal_id = str(uuid4())
-    
-    # Calculate betting close time
-    betting_closes = request.expected_announcement
     
     # Create market data
     market_data = {
@@ -115,14 +135,20 @@ def create_market(request: CreateMarketRequest):
         "teams": request.teams,
         "data_sources": request.data_sources.model_dump(),
         "expected_announcement": request.expected_announcement,
-        "betting_closes": betting_closes,
+        "betting_closes": request.expected_announcement,
         "status": "active",
         "volume_usd": 0.0,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "fee_paid": False
     }
     
-    # Store in memory
+    # Store in database
+    db_success = create_market(market_data)
+    
+    if not db_success:
+        raise HTTPException(status_code=400, detail="Market already exists")
+    
+    # Update in-memory cache
     active_markets[request.market_id] = market_data
     
     # Start monitoring (background task)
@@ -133,6 +159,9 @@ def create_market(request: CreateMarketRequest):
         expected_announcement=request.expected_announcement
     ))
     
+    # Send webhook notification
+    await notifier.notify_market_created(market_data)
+    
     logger.info(f"Market {request.market_id} created. Monitoring started.")
     
     return {
@@ -142,76 +171,102 @@ def create_market(request: CreateMarketRequest):
         "message": "Market created. Monitoring started."
     }
 
+@app.get("/api/v1/markets", response_model=list)
+def list_markets():
+    """List all markets"""
+    markets = get_all_markets()
+    return markets
+
 @app.get("/api/v1/markets/{market_id}", response_model=MarketResponse)
-def get_market(market_id: str):
+def get_market_endpoint(market_id: str):
     """Get market status and odds"""
-    if market_id not in active_markets:
+    market = get_market(market_id)
+    
+    if not market:
         raise HTTPException(status_code=404, detail="Market not found")
     
-    market = active_markets[market_id]
+    # Parse teams from comma-separated string
+    teams = market["teams"].split(",") if market["teams"] else []
     
-    # Calculate odds based on volume (placeholder - real implementation would use actual bets)
-    odds = {team: 1.0 for team in market["teams"]}
+    # Calculate odds based on volume (placeholder)
+    odds = {team: 1.0 for team in teams}
     
     return MarketResponse(
         market_id=market_id,
         hackathon_name=market["hackathon_name"],
         status=market["status"],
-        teams=market["teams"],
+        teams=teams,
         volume_usd=market["volume_usd"],
         odds=odds,
         resolution_status=market.get("resolution_status"),
         winner=market.get("winner"),
-        fee_paid=market["fee_paid"]
+        fee_paid=bool(market["fee_paid"])
     )
 
 @app.post("/api/v1/markets/{market_id}/close-betting")
-def close_betting(market_id: str):
+async def close_betting(market_id: str):
     """Close betting for a market"""
-    if market_id not in active_markets:
+    market = get_market(market_id)
+    if not market:
         raise HTTPException(status_code=404, detail="Market not found")
     
-    active_markets[market_id]["status"] = "betting_closed"
-    logger.info(f"Betting closed for market: {market_id}")
+    success = db_close_market_betting(market_id)
     
-    return {
-        "status": "success",
-        "market_id": market_id,
-        "message": "Betting closed"
-    }
+    if success:
+        # Update cache
+        if market_id in active_markets:
+            active_markets[market_id]["status"] = "betting_closed"
+        
+        # Send webhook
+        await notifier.notify_betting_closed(market)
+        logger.info(f"Betting closed for market: {market_id}")
+        
+        return {
+            "status": "success",
+            "market_id": market_id,
+            "message": "Betting closed"
+        }
+    
+    raise HTTPException(status_code=500, detail="Failed to close betting")
 
 @app.post("/api/v1/markets/{market_id}/resolve")
-def resolve_market(market_id: str, winner: str, background_tasks: BackgroundTasks):
+async def resolve_market_endpoint(market_id: str, winner: str):
     """Resolve a market with the winning team"""
-    if market_id not in active_markets:
+    market = get_market(market_id)
+    if not market:
         raise HTTPException(status_code=404, detail="Market not found")
     
-    market = active_markets[market_id]
+    teams = market["teams"].split(",") if market["teams"] else []
     
-    if winner not in market["teams"]:
+    if winner not in teams:
         raise HTTPException(status_code=400, detail="Winner must be a valid team name")
     
     # Calculate and collect fee
     fee_amount = fee_calculator.calculate_fee(market["volume_usd"])
     
-    # Record fee payment
+    # Record fee
     fee_record = {
         "market_id": market_id,
         "platform_id": market["platform_id"],
         "volume_usd": market["volume_usd"],
         "fee_percentage": fee_calculator.fee_percentage,
         "fee_amount_usd": fee_amount,
-        "fee_wallet": fee_calculator.fee_wallet_address,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "fee_wallet": fee_calculator.fee_wallet_address
     }
-    fee_history.append(fee_record)
+    record_fee(fee_record)
     
     # Update market
-    active_markets[market_id]["status"] = "resolved"
-    active_markets[market_id]["winner"] = winner
-    active_markets[market_id]["resolution_status"] = "success"
-    active_markets[market_id]["fee_paid"] = True
-    active_markets[market_id]["fee_amount"] = fee_amount
+    db_resolve_market(market_id, winner, "success")
+    
+    # Update cache
+    if market_id in active_markets:
+        active_markets[market_id]["status"] = "resolved"
+        active_markets[market_id]["winner"] = winner
+        active_markets[market_id]["fee_paid"] = True
+    
+    # Send webhook
+    market["winner"] = winner
+    await notifier.notify_market_resolved(market, winner, fee_amount)
     
     logger.info(f"Market {market_id} resolved. Winner: {winner}. Fee: ${fee_amount}")
     
@@ -224,27 +279,104 @@ def resolve_market(market_id: str, winner: str, background_tasks: BackgroundTask
     }
 
 @app.get("/api/v1/fees")
-def get_fee_history():
+def get_fee_history_endpoint():
     """Get fee collection history"""
+    history = get_fee_history()
+    total = sum(r["fee_amount_usd"] for r in history)
+    
     return {
-        "total_fees_collected": sum(r["fee_amount_usd"] for r in fee_history),
+        "total_fees_collected_usd": total,
         "fee_wallet": fee_calculator.fee_wallet_address,
-        "history": fee_history
+        "history": history
     }
 
 @app.post("/api/v1/markets/{market_id}/volume")
 def update_volume(market_id: str, volume_usd: float):
-    """Update trading volume for a market (called by platform when trades happen)"""
-    if market_id not in active_markets:
+    """Update trading volume for a market"""
+    market = get_market(market_id)
+    if not market:
         raise HTTPException(status_code=404, detail="Market not found")
     
-    active_markets[market_id]["volume_usd"] = volume_usd
+    update_market_volume(market_id, volume_usd)
+    
+    # Update cache
+    if market_id in active_markets:
+        active_markets[market_id]["volume_usd"] = volume_usd
     
     return {
         "status": "success",
         "market_id": market_id,
         "volume_usd": volume_usd,
         "fee_at_resolution": fee_calculator.calculate_fee(volume_usd)
+    }
+
+# ============================================================================
+# WEBHOOK ENDPOINTS
+# ============================================================================
+
+@app.post("/api/v1/webhooks", response_model=WebhookResponse)
+def register_webhook_endpoint(request: RegisterWebhookRequest):
+    """Register a webhook for event notifications"""
+    webhook_id = register_webhook(
+        platform_id=request.platform_id,
+        url=request.url,
+        event_types=request.event_types
+    )
+    
+    return WebhookResponse(
+        webhook_id=webhook_id,
+        platform_id=request.platform_id,
+        url=request.url,
+        event_types=request.event_types,
+        message="Webhook registered successfully"
+    )
+
+@app.get("/api/v1/webhooks")
+def list_webhooks(platform_id: str = None):
+    """List registered webhooks"""
+    webhooks = get_webhooks(platform_id)
+    
+    # Parse event_types from comma-separated string
+    for webhook in webhooks:
+        webhook["event_types"] = webhook.get("event_types", "").split(",")
+    
+    return webhooks
+
+# ============================================================================
+# SCRAPING ENDPOINTS (for testing/manual triggers)
+# ============================================================================
+
+@app.post("/api/v1/scrape/{market_id}")
+async def scrape_market_website(market_id: str):
+    """Manually trigger website scrape for a market"""
+    market = get_market(market_id)
+    if not market:
+        raise HTTPException(status_code=404, detail="Market not found")
+    
+    data_sources = eval(market["data_sources"]) if isinstance(market["data_sources"], str) else market["data_sources"]
+    teams = market["teams"].split(",") if market["teams"] else []
+    
+    results = []
+    
+    # Scrape website if provided
+    if data_sources.get("website"):
+        result = await website_scraper.scrape(
+            url=data_sources["website"],
+            teams=teams
+        )
+        results.append(result)
+        
+        if result["winners_found"]:
+            await notifier.notify_winner_detected(
+                market, 
+                result["winners_found"][0],
+                result["confidence"],
+                "website"
+            )
+    
+    return {
+        "market_id": market_id,
+        "scrape_results": results
     }
 
 if __name__ == "__main__":

@@ -26,6 +26,33 @@ When a market resolves, 2% of the trading volume is collected as the oracle fee.
 
 ---
 
+## Features
+
+### ✅ Core Features
+- **Market Creation** - Create markets with team names and data sources
+- **Fee Collection** - Automatic 2% fee on trading volume
+- **Market Resolution** - Manual or automatic resolution
+- **Volume Tracking** - Real-time volume updates from platforms
+
+### ✅ Auto-Monitoring
+- **Website Scraping** - Monitors hackathon websites for winner announcements
+- **Twitter Monitoring** - Checks Twitter for result announcements (requires API)
+- **Discord Monitoring** - Monitors Discord channels (requires bot token)
+- **Confidence Scoring** - High-confidence detections auto-resolve markets
+
+### ✅ Database Persistence
+- **SQLite Database** - All markets, fees, and results stored persistently
+- **Webhook Notifications** - Real-time notifications to platforms
+- **Scraping History** - All scraping results logged for audit
+
+### ✅ Webhooks
+- `market_created` - New market created
+- `market_resolved` - Market resolved with winner
+- `betting_closed` - Betting closed for market
+- `winner_detected` - Potential winner detected in monitoring
+
+---
+
 ## Quick Start
 
 ```bash
@@ -51,51 +78,57 @@ POST /api/v1/markets
 
 ```json
 {
-  "platform_id": "prediction-pro",
-  "market_id": "colosseum-team-xyz",
-  "hackathon_name": "Colosseum Spring 2026",
-  "teams": ["TeamX", "TeamY", "TeamZ"],
+  "platform_id": "your-platform",
+  "market_id": "unique-market-id",
+  "hackathon_name": "ETHGlobal Tokyo 2024",
+  "teams": ["Team Alpha", "Team Beta", "Team Gamma"],
   "data_sources": {
-    "twitter": "@ColosseumHQ",
-    "website": "https://colosseum.io/results",
-    "discord": "colosseum.gg/discord"
+    "twitter": "@ethglobal",
+    "website": "https://ethglobal.com/results"
   },
-  "expected_announcement": "2026-04-20T00:00:00Z",
-  "betting_closes_hours_before": 48
+  "expected_announcement": "2024-04-15T00:00:00Z"
 }
 ```
 
-### Get Market Status
+### Get Market
 
 ```http
 GET /api/v1/markets/{market_id}
 ```
 
-### Update Trading Volume
+### Update Volume
 
 ```http
-POST /api/v1/markets/{market_id}/volume
-Content-Type: application/json
-
-{"volume_usd": 5000}
+POST /api/v1/markets/{market_id}/volume?volume_usd=10000
 ```
 
-### Close Betting
+### Resolve Market
 
 ```http
-POST /api/v1/markets/{market_id}/close-betting
+POST /api/v1/markets/{market_id}/resolve?winner=Team%20Alpha
 ```
 
-### Resolve Market (Manual)
+### Register Webhook
 
 ```http
-POST /api/v1/markets/{market_id}/resolve
-Content-Type: application/json
-
-{"winner": "TeamX"}
+POST /api/v1/webhooks
 ```
 
-### Fee History
+```json
+{
+  "platform_id": "your-platform",
+  "url": "https://your-platform.com/webhooks/oracle",
+  "event_types": ["market_resolved", "winner_detected"]
+}
+```
+
+### Scrape Website (Manual)
+
+```http
+POST /api/v1/scrape/{market_id}
+```
+
+### Get Fee History
 
 ```http
 GET /api/v1/fees
@@ -103,129 +136,45 @@ GET /api/v1/fees
 
 ---
 
-## How It Works
+## Monitoring Flow
 
 ```
-1. Platform creates market with hackathon data sources
+1. Platform creates market with data_sources
    ↓
-2. Our oracle starts monitoring (Twitter, website, Discord)
+2. Oracle starts monitoring:
+   - Website: Periodic scraping for winner keywords
+   - Twitter: Checks for result announcements (API required)
+   - Discord: Monitors channels (Bot required)
    ↓
-3. Traders buy YES/NO tokens on the platform
+3. Winner detected (confidence ≥ 0.5)
    ↓
-4. Platform updates volume as trades happen
+4. Webhook: winner_detected sent to platform
    ↓
-5. When winner is announced publicly, we detect it
+5. Auto-resolve if confidence ≥ 0.8
    ↓
-6. Market resolves - 2% fee collected to our wallet
+6. Webhook: market_resolved sent
    ↓
-7. Platform distributes winnings to traders
-```
-
----
-
-## Data Sources
-
-The oracle can monitor:
-
-| Source | Config Field | Example |
-|--------|--------------|---------|
-| **Twitter** | `twitter` | `@ColosseumHQ` |
-| **Website** | `website` | `https://colosseum.io/results` |
-| **Discord** | `discord` | `colosseum.gg/discord` |
-
-**Minimum requirement:** At least one data source must be provided.
-
----
-
-## Anti-Abuse Protections
-
-| Protection | How it Works |
-|------------|--------------|
-| **Time-lock** | Betting closes 24-48h before expected announcement |
-| **Multi-source** | Confirms winner from 2+ sources before resolving |
-| **Automated** | No manual override - oracle decides based on data |
-| **Dispute period** | 24h challenge window after resolution |
-
----
-
-## Integration Example (Python)
-
-```python
-import httpx
-
-# Create a market
-response = httpx.post("http://localhost:8000/api/v1/markets", json={
-    "platform_id": "my-platform",
-    "market_id": "hackathon-team-x",
-    "hackathon_name": "Colosseum Spring 2026",
-    "teams": ["TeamX", "TeamY", "TeamZ"],
-    "data_sources": {
-        "twitter": "@ColosseumHQ"
-    },
-    "expected_announcement": "2026-04-20T00:00:00Z"
-})
-
-print(response.json())
+7. Platform settles winners, oracle collects 2% fee
 ```
 
 ---
 
-## Project Structure
+## Webhook Payload
 
+```json
+{
+  "event": "market_resolved",
+  "timestamp": "2024-04-15T12:00:00Z",
+  "data": {
+    "market_id": "unique-market-id",
+    "hackathon_name": "ETHGlobal Tokyo 2024",
+    "winner": "Team Alpha",
+    "fee_collected_usd": 200.00,
+    "status": "resolved"
+  }
+}
 ```
-hackathon-oracle-api/
-├── README.md              # This file
-├── requirements.txt      # Python dependencies
-├── api/
-│   ├── __init__.py
-│   ├── main.py          # FastAPI server + endpoints
-│   ├── fee_calculator.py # 2% fee logic
-│   └── resolution.py     # Oracle monitoring
 
-```
-
----
-
-## Technology Stack
-
-- **Framework:** FastAPI
-- **Language:** Python 3.11+
-- **Validation:** Pydantic
-- **Monitoring:** Background asyncio tasks
-- **Data Storage:** In-memory (use database in production)
-
----
-
-## Development Status
-
-**Current:** MVP with core functionality
-
-**To Do:**
-- [ ] Twitter API v2 integration for real monitoring
-- [ ] Website scraping for result pages
-- [ ] Discord bot for channel monitoring
-- [ ] Database persistence (SQLite/PostgreSQL)
-- [ ] Client libraries (Python, TypeScript, Rust)
-- [ ] Rate limiting
-- [ ] Admin dashboard
-
----
-
-## Contributing
-
-1. Fork the repo
-2. Create a feature branch
-3. Submit PR with tests
-
----
-
-## License
-
-MIT
-
----
-
-**Note:** This API is designed for prediction market platforms. If you're building a platform and want to integrate, contact us for API access.
 ---
 
 ## Deployment
@@ -239,21 +188,6 @@ cd hackathon-oracle-api
 
 # Run deploy script
 ./deploy.sh
-```
-
-### Google Cloud Run (Manual)
-
-```bash
-# Build and push
-docker build --platform linux/amd64 -t gcr.io/predictionpro-io/hackathon-oracle-api:latest .
-docker push gcr.io/predictionpro-io/hackathon-oracle-api:latest
-
-# Deploy
-gcloud run deploy hackathon-oracle-api \
-  --image=gcr.io/predictionpro-io/hackathon-oracle-api:latest \
-  --region=europe-west1 \
-  --platform=managed \
-  --allow-unauthenticated
 ```
 
 ### GitHub Actions (Auto-Deploy)
@@ -272,3 +206,43 @@ Push to main branch triggers automatic deployment via GitHub Actions.
 ```bash
 curl https://hackathon-oracle-api-752364645771.europe-west1.run.app/
 ```
+
+---
+
+## Project Structure
+
+```
+hackathon-oracle-api/
+├── README.md              # This file
+├── requirements.txt       # Python dependencies
+├── Dockerfile             # Docker image
+├── deploy.sh             # Local deployment script
+├── cloudbuild.yaml        # Cloud Build config
+└── api/
+    ├── __init__.py
+    ├── main.py            # FastAPI application
+    ├── database.py        # SQLite persistence
+    ├── fee_calculator.py   # Fee calculation logic
+    ├── resolution.py       # Oracle monitoring
+    ├── scraping.py         # Website/Twitter/Discord scrapers
+    └── webhooks.py        # Webhook notifications
+```
+
+---
+
+## Requirements
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| fastapi | 0.109.0 | Web framework |
+| uvicorn | 0.27.0 | ASGI server |
+| pydantic | 2.6.0 | Data validation |
+| httpx | 0.26.0 | HTTP client (scraping) |
+| loguru | 0.7.2 | Logging |
+| python-dotenv | 1.0.0 | Environment variables |
+
+---
+
+## License
+
+MIT
