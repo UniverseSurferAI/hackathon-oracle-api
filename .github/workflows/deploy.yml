@@ -31,10 +31,10 @@ jobs:
           docker push europe-west1-docker.pkg.dev/predictionpro-io/cloud-run-source-deploy/hackathon-oracle-api:${{ github.sha }}
       
       - name: Deploy to Cloud Run
-        run: |
-          gcloud beta run deploy hackathon-oracle-api \
-            --image=europe-west1-docker.pkg.dev/predictionpro-io/cloud-run-source-deploy/hackathon-oracle-api:${{ github.sha }} \
-            --region=europe-west1 \
-            --platform=managed \
-            --allow-unauthenticated \
-            --quiet
+        uses: google-github-actions/deploy-cloudrun@v1
+        with:
+          service: hackathon-oracle-api
+          region: europe-west1
+          image: europe-west1-docker.pkg.dev/predictionpro-io/cloud-run-source-deploy/hackathon-oracle-api:${{ github.sha }}
+          credentials: ${{ secrets.GCP_SA_KEY }}
+          allow_unauthenticated: true
