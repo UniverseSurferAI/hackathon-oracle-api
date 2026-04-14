@@ -226,3 +226,49 @@ MIT
 ---
 
 **Note:** This API is designed for prediction market platforms. If you're building a platform and want to integrate, contact us for API access.
+---
+
+## Deployment
+
+### Local Deployment
+
+```bash
+# Clone the repo
+git clone https://github.com/UniverseSurferAI/hackathon-oracle-api.git
+cd hackathon-oracle-api
+
+# Run deploy script
+./deploy.sh
+```
+
+### Google Cloud Run (Manual)
+
+```bash
+# Build and push
+docker build --platform linux/amd64 -t gcr.io/predictionpro-io/hackathon-oracle-api:latest .
+docker push gcr.io/predictionpro-io/hackathon-oracle-api:latest
+
+# Deploy
+gcloud run deploy hackathon-oracle-api \
+  --image=gcr.io/predictionpro-io/hackathon-oracle-api:latest \
+  --region=europe-west1 \
+  --platform=managed \
+  --allow-unauthenticated
+```
+
+### GitHub Actions (Auto-Deploy)
+
+Push to main branch triggers automatic deployment via GitHub Actions.
+
+**Note:** GitHub Actions deployment requires GCP service account key configured as `GCP_SA_KEY` secret.
+
+---
+
+## Live API
+
+**Production URL:** https://hackathon-oracle-api-752364645771.europe-west1.run.app
+
+**Health Check:**
+```bash
+curl https://hackathon-oracle-api-752364645771.europe-west1.run.app/
+```
