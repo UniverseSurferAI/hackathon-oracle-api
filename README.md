@@ -10,7 +10,7 @@ Hackathon Oracle API enables prediction market platforms to create markets on ha
 
 **The Problem:** Prediction markets need a trusted way to resolve hackathon winner markets without manual intervention.
 
-**Our Solution:** Platforms create markets with hackathon data sources (Twitter, website, Discord). Our oracle monitors these sources. When winners are announced publicly, we automatically resolve the market and collect our 2% fee.
+**Our Solution:** Platforms create markets with hackathon data sources (Twitter, website, Discord). Our oracle monitors these sources. When winners are announced publicly, we automatically resolve the market.
 
 ---
 
@@ -19,37 +19,11 @@ Hackathon Oracle API enables prediction market platforms to create markets on ha
 | Component | Details |
 |-----------|---------|
 | **Platform Fee** | 2% on volume traded |
-| **Settlement** | USDC on Ethereum |
-| **Fee Wallet** | `0x7252c6477139989916F5c41b969208C5B947AC1d` |
+| **Collection** | When betting closes (24-48h before announcement) |
+| **Settlement** | USDC on Solana to: `0x7252c6477139989916F5c41b969208C5B947AC1d` |
+| **Verification** | On-chain verification required |
 
-When a market resolves, 2% of the trading volume is collected as the oracle fee.
-
----
-
-## Features
-
-### ✅ Core Features
-- **Market Creation** - Create markets with team names and data sources
-- **Fee Collection** - Automatic 2% fee on trading volume
-- **Market Resolution** - Manual or automatic resolution
-- **Volume Tracking** - Real-time volume updates from platforms
-
-### ✅ Auto-Monitoring
-- **Website Scraping** - Monitors hackathon websites for winner announcements
-- **Twitter Monitoring** - Checks Twitter for result announcements (requires API)
-- **Discord Monitoring** - Monitors Discord channels (requires bot token)
-- **Confidence Scoring** - High-confidence detections auto-resolve markets
-
-### ✅ Database Persistence
-- **SQLite Database** - All markets, fees, and results stored persistently
-- **Webhook Notifications** - Real-time notifications to platforms
-- **Scraping History** - All scraping results logged for audit
-
-### ✅ Webhooks
-- `market_created` - New market created
-- `market_resolved` - Market resolved with winner
-- `betting_closed` - Betting closed for market
-- `winner_detected` - Potential winner detected in monitoring
+**Important:** Platforms must send the 2% fee to the oracle wallet when betting closes. The oracle will verify the payment on-chain.
 
 ---
 
@@ -68,9 +42,9 @@ uvicorn api.main:app --reload --port 8000
 
 ---
 
-## API Endpoints
+## Platform Integration Guide
 
-### Create Market
+### Step 1: Create a Market
 
 ```http
 POST /api/v1/markets
@@ -78,37 +52,97 @@ POST /api/v1/markets
 
 ```json
 {
-  "platform_id": "your-platform",
+  "platform_id": "your-platform-id",
   "market_id": "unique-market-id",
-  "hackathon_name": "ETHGlobal Tokyo 2024",
+  "hackathon_name": "ETHGlobal Paris 2024",
   "teams": ["Team Alpha", "Team Beta", "Team Gamma"],
   "data_sources": {
     "twitter": "@ethglobal",
     "website": "https://ethglobal.com/results"
   },
-  "expected_announcement": "2024-04-15T00:00:00Z"
+  "expected_announcement": "2024-04-15T00:00:00Z",
+  "betting_closes_hours_before": 24
 }
 ```
 
-### Get Market
-
-```http
-GET /api/v1/markets/{market_id}
+**Response:**
+```json
+{
+  "status": "success",
+  "market_id": "unique-market-id",
+  "betting_closes_at": "2024-04-14T00:00:00Z",
+  "message": "Market created. Volume tracking started."
+}
 ```
 
-### Update Volume
+---
+
+### Step 2: Report Trading Volume
+
+Call this whenever users place bets on your platform:
 
 ```http
 POST /api/v1/markets/{market_id}/volume?volume_usd=10000
 ```
 
-### Resolve Market
+**Important:** This should be the **cumulative total volume** for this market, not incremental.
 
-```http
-POST /api/v1/markets/{market_id}/resolve?winner=Team%20Alpha
+```json
+{
+  "status": "success",
+  "market_id": "unique-market-id",
+  "volume_usd": 10000.0,
+  "fee_at_close_usd": 200.0,
+  "fee_wallet": "0x7252c6477139989916F5c41b969208C5B947AC1d",
+  "message": "Volume updated. Fee will be collected when betting closes."
+}
 ```
 
-### Register Webhook
+---
+
+### Step 3: When Betting Closes
+
+Your platform should call:
+
+```http
+POST /api/v1/markets/{market_id}/close-betting
+```
+
+**Or the oracle will auto-close at the scheduled time.**
+
+**Response:**
+```json
+{
+  "status": "success",
+  "market_id": "unique-market-id",
+  "volume_usd": 10000.0,
+  "fee_amount_usd": 200.0,
+  "fee_wallet": "0x7252c6477139989916F5c41b969208C5B947AC1d",
+  "message": "Betting closed. Fee calculated. Platform must send USDC to oracle wallet."
+}
+```
+
+---
+
+### Step 4: Pay the Fee
+
+Send `fee_amount_usd` USDC to the oracle wallet:
+
+```
+Recipient: 0x7252c6477139989916F5c41b969208C5B947AC1d
+Network: Solana (USDC)
+Amount: fee_amount_usd
+```
+
+**For Solana USDC:**
+- Mint: `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDj1v`
+- Use Phantom wallet or any Solana wallet
+
+---
+
+### Step 5: (Optional) Register Webhook
+
+Get notified when markets resolve:
 
 ```http
 POST /api/v1/webhooks
@@ -116,23 +150,30 @@ POST /api/v1/webhooks
 
 ```json
 {
-  "platform_id": "your-platform",
+  "platform_id": "your-platform-id",
   "url": "https://your-platform.com/webhooks/oracle",
-  "event_types": ["market_resolved", "winner_detected"]
+  "event_types": ["market_created", "market_resolved", "betting_closed", "winner_detected"]
 }
 ```
 
-### Scrape Website (Manual)
+---
 
-```http
-POST /api/v1/scrape/{market_id}
-```
+## API Endpoints
 
-### Get Fee History
-
-```http
-GET /api/v1/fees
-```
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/` | Health check |
+| `POST` | `/api/v1/markets` | Create a new market |
+| `GET` | `/api/v1/markets` | List all markets |
+| `GET` | `/api/v1/markets/{id}` | Get market details |
+| `POST` | `/api/v1/markets/{id}/volume` | Update trading volume |
+| `POST` | `/api/v1/markets/{id}/close-betting` | Close betting and calculate fee |
+| `POST` | `/api/v1/markets/{id}/resolve` | Resolve with winner |
+| `GET` | `/api/v1/fees` | Get fee history |
+| `GET` | `/api/v1/wallet/balance` | Get oracle USDC balance |
+| `POST` | `/api/v1/webhooks` | Register webhook |
+| `GET` | `/api/v1/webhooks` | List webhooks |
+| `POST` | `/api/v1/scrape/{id}` | Trigger manual scrape |
 
 ---
 
@@ -143,18 +184,20 @@ GET /api/v1/fees
    ↓
 2. Oracle starts monitoring:
    - Website: Periodic scraping for winner keywords
-   - Twitter: Checks for result announcements (API required)
-   - Discord: Monitors channels (Bot required)
+   - Twitter: Checks for result announcements
+   - Discord: Monitors channels
    ↓
 3. Winner detected (confidence ≥ 0.5)
    ↓
 4. Webhook: winner_detected sent to platform
    ↓
-5. Auto-resolve if confidence ≥ 0.8
+5. Betting closes → Fee invoice generated
    ↓
-6. Webhook: market_resolved sent
+6. Platform pays fee to oracle wallet
    ↓
-7. Platform settles winners, oracle collects 2% fee
+7. Platform calls resolve with winner
+   ↓
+8. Webhook: market_resolved sent
 ```
 
 ---
@@ -163,17 +206,27 @@ GET /api/v1/fees
 
 ```json
 {
-  "event": "market_resolved",
-  "timestamp": "2024-04-15T12:00:00Z",
+  "event": "betting_closed",
+  "timestamp": "2024-04-14T12:00:00Z",
   "data": {
     "market_id": "unique-market-id",
-    "hackathon_name": "ETHGlobal Tokyo 2024",
-    "winner": "Team Alpha",
-    "fee_collected_usd": 200.00,
-    "status": "resolved"
+    "hackathon_name": "ETHGlobal Paris 2024",
+    "volume_usd": 10000.0,
+    "fee_amount_usd": 200.0,
+    "fee_wallet": "0x7252c6477139989916F5c41b969208C5B947AC1d",
+    "status": "betting_closed"
   }
 }
 ```
+
+---
+
+## Auto-Monitoring
+
+- **Website Scraping** - Monitors hackathon websites for winner announcements
+- **Twitter Monitoring** - Checks Twitter for result announcements (requires API)
+- **Discord Monitoring** - Monitors Discord channels (requires bot token)
+- **Confidence Scoring** - High-confidence detections auto-resolve markets
 
 ---
 
@@ -182,19 +235,15 @@ GET /api/v1/fees
 ### Local Deployment
 
 ```bash
-# Clone the repo
 git clone https://github.com/UniverseSurferAI/hackathon-oracle-api.git
 cd hackathon-oracle-api
-
-# Run deploy script
-./deploy.sh
+pip install -r requirements.txt
+uvicorn api.main:app --reload --port 8000
 ```
 
 ### GitHub Actions (Auto-Deploy)
 
 Push to main branch triggers automatic deployment via GitHub Actions.
-
-**Note:** GitHub Actions deployment requires GCP service account key configured as `GCP_SA_KEY` secret.
 
 ---
 
@@ -216,16 +265,15 @@ hackathon-oracle-api/
 ├── README.md              # This file
 ├── requirements.txt       # Python dependencies
 ├── Dockerfile             # Docker image
-├── deploy.sh             # Local deployment script
-├── cloudbuild.yaml        # Cloud Build config
-└── api/
-    ├── __init__.py
-    ├── main.py            # FastAPI application
-    ├── database.py        # SQLite persistence
-    ├── fee_calculator.py   # Fee calculation logic
-    ├── resolution.py       # Oracle monitoring
-    ├── scraping.py         # Website/Twitter/Discord scrapers
-    └── webhooks.py        # Webhook notifications
+├── api/
+│   ├── __init__.py
+│   ├── main.py            # FastAPI application
+│   ├── database.py        # SQLite persistence
+│   ├── fee_calculator.py  # Fee calculation logic
+│   ├── resolution.py      # Oracle monitoring
+│   ├── scraping.py        # Website/Twitter/Discord scrapers
+│   ├── solana_service.py # Solana integration (balance check, verification)
+│   └── webhooks.py        # Webhook notifications
 ```
 
 ---
@@ -239,7 +287,8 @@ hackathon-oracle-api/
 | pydantic | 2.6.0 | Data validation |
 | httpx | 0.26.0 | HTTP client (scraping) |
 | loguru | 0.7.2 | Logging |
-| python-dotenv | 1.0.0 | Environment variables |
+| solana | ≥0.35.0 | Solana blockchain interaction |
+| solders | ≥0.20.0 | Solana primitives |
 
 ---
 
