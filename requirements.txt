@@ -4,3 +4,5 @@ pydantic==2.6.0
 httpx==0.26.0
 python-dotenv==1.0.0
 loguru==0.7.2
+solana>=0.35.0
+solders>=0.20.0

@@ -49,6 +49,8 @@ def init_db():
             fee_percentage REAL NOT NULL,
             fee_amount_usd REAL NOT NULL,
             fee_wallet TEXT NOT NULL,
+            onchain_withdrawn INTEGER DEFAULT 0,
+            tx_signature TEXT,
             timestamp TEXT NOT NULL
         )
     """)
@@ -186,6 +188,44 @@ def close_market_betting(market_id: str) -> bool:
     cursor.execute("""
         UPDATE markets SET status = 'betting_closed', updated_at = ? WHERE market_id = ?
     """, (datetime.utcnow().isoformat(), market_id))
+    conn.commit()
+    success = cursor.rowcount > 0
+    conn.close()
+    return success
+
+def update_market_fee_paid(market_id: str, fee_amount: float = None) -> bool:
+    """Mark a market's fee as paid"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    if fee_amount:
+        cursor.execute("""
+            UPDATE markets SET fee_paid = 1, fee_amount = ?, updated_at = ? WHERE market_id = ?
+        """, (fee_amount, datetime.utcnow().isoformat(), market_id))
+    else:
+        cursor.execute("""
+            UPDATE markets SET fee_paid = 1, updated_at = ? WHERE market_id = ?
+        """, (datetime.utcnow().isoformat(), market_id))
+    
+    conn.commit()
+    success = cursor.rowcount > 0
+    conn.close()
+    return success
+
+def update_fee_withdrawn(market_id: str, tx_signature: str = None) -> bool:
+    """Mark a fee as withdrawn on-chain"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    if tx_signature:
+        cursor.execute("""
+            UPDATE fee_history SET onchain_withdrawn = 1, tx_signature = ? WHERE market_id = ?
+        """, (tx_signature, market_id))
+    else:
+        cursor.execute("""
+            UPDATE fee_history SET onchain_withdrawn = 1 WHERE market_id = ?
+        """, (market_id,))
+    
     conn.commit()
     success = cursor.rowcount > 0
     conn.close()

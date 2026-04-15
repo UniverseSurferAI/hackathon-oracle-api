@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
+import os
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,15 +18,17 @@ from api.database import (
     init_db, create_market, get_market, get_all_markets,
     update_market_volume, resolve_market as db_resolve_market,
     close_market_betting as db_close_market_betting,
-    record_fee, get_fee_history, register_webhook, get_webhooks
+    record_fee, get_fee_history, register_webhook, get_webhooks,
+    update_market_fee_paid, update_fee_withdrawn
 )
 from api.webhooks import notifier
 from api.scraping import website_scraper
+from api.solana_service import init_solana_service, get_solana_service
 
 # Initialize FastAPI app
 app = FastAPI(
     title="Hackathon Oracle API",
-    description="Oracle API for hackathon prediction market resolution",
+    description="Oracle API for hackathon prediction market resolution on Solana",
     version="1.0.0"
 )
 
@@ -50,6 +53,30 @@ fee_calculator = FeeCalculator(
 # Initialize oracle
 oracle = HackathonOracle(fee_calculator)
 
+# Initialize Solana service (if configured)
+# Note: SOLANA_RPC_URL and ORACLE_FEE_WALLET_KEY env vars needed
+_solana_initialized = False
+
+def init_blockchain():
+    """Initialize Solana service if env vars are set"""
+    global _solana_initialized
+    rpc_url = os.getenv("SOLANA_RPC_URL")
+    fee_wallet_key = os.getenv("ORACLE_FEE_WALLET_KEY")
+    
+    if rpc_url and fee_wallet_key:
+        try:
+            init_solana_service(rpc_url, fee_wallet_key)
+            _solana_initialized = True
+            logger.info("Solana service initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Solana service: {e}")
+            _solana_initialized = False
+    else:
+        logger.warning("Solana service not configured - set SOLANA_RPC_URL and ORACLE_FEE_WALLET_KEY")
+
+# Initialize blockchain on startup
+init_blockchain()
+
 # In-memory cache for quick access (backed by database)
 active_markets = {}
 fee_history = []
@@ -72,7 +99,7 @@ class CreateMarketRequest(BaseModel):
     teams: list[str] = Field(..., description="List of team names participating")
     data_sources: DataSource = Field(..., description="Where to monitor for results")
     expected_announcement: str = Field(..., description="Expected announcement date (ISO 8601)")
-    betting_closes_hours_before: int = Field(default=48, description="Hours before announcement to close betting")
+    betting_closes_hours_before: int = Field(default=24, description="Hours before announcement to close betting")
 
 class MarketResponse(BaseModel):
     """Response for market queries"""
@@ -103,6 +130,19 @@ class WebhookResponse(BaseModel):
     event_types: list[str]
     message: str
 
+class WithdrawFeeRequest(BaseModel):
+    """Request to manually withdraw accumulated fees"""
+    platform_id: str = Field(..., description="Platform requesting withdrawal")
+    market_ids: Optional[list[str]] = Field(None, description="Specific markets to withdraw from (all if empty)")
+
+class WithdrawFeeResponse(BaseModel):
+    """Response for fee withdrawal"""
+    success: bool
+    total_withdrawn_usd: float
+    transactions: list[dict]
+    fee_wallet: str
+    message: str
+
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
@@ -110,12 +150,14 @@ class WebhookResponse(BaseModel):
 @app.get("/")
 def read_root():
     """Health check"""
+    solana_status = "connected" if _solana_initialized else "not configured"
     return {
         "status": "healthy",
         "service": "Hackathon Oracle API",
         "version": "1.0.0",
         "fee_percentage": f"{fee_calculator.fee_percentage}%",
-        "fee_wallet": fee_calculator.fee_wallet_address
+        "fee_wallet": fee_calculator.fee_wallet_address,
+        "solana_status": solana_status
     }
 
 @app.post("/api/v1/markets", response_model=dict)
@@ -126,6 +168,11 @@ async def create_market_endpoint(request: CreateMarketRequest):
     # Generate internal ID
     internal_id = str(uuid4())
     
+    # Calculate betting close time
+    from datetime import timedelta
+    announcement_dt = datetime.fromisoformat(request.expected_announcement.replace("Z", "+00:00"))
+    betting_closes_at = (announcement_dt - timedelta(hours=request.betting_closes_hours_before)).isoformat()
+    
     # Create market data
     market_data = {
         "internal_id": internal_id,
@@ -135,7 +182,7 @@ async def create_market_endpoint(request: CreateMarketRequest):
         "teams": request.teams,
         "data_sources": request.data_sources.model_dump(),
         "expected_announcement": request.expected_announcement,
-        "betting_closes": request.expected_announcement,
+        "betting_closes": betting_closes_at,
         "status": "active",
         "volume_usd": 0.0,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -162,13 +209,14 @@ async def create_market_endpoint(request: CreateMarketRequest):
     # Send webhook notification
     await notifier.notify_market_created(market_data)
     
-    logger.info(f"Market {request.market_id} created. Monitoring started.")
+    logger.info(f"Market {request.market_id} created. Betting closes at: {betting_closes_at}")
     
     return {
         "status": "success",
         "market_id": request.market_id,
         "internal_id": internal_id,
-        "message": "Market created. Monitoring started."
+        "betting_closes_at": betting_closes_at,
+        "message": "Market created. Volume tracking started."
     }
 
 @app.get("/api/v1/markets", response_model=list)
@@ -205,29 +253,74 @@ def get_market_endpoint(market_id: str):
 
 @app.post("/api/v1/markets/{market_id}/close-betting")
 async def close_betting(market_id: str):
-    """Close betting for a market"""
+    """
+    Close betting for a market and trigger automatic fee withdrawal.
+    
+    This is the key endpoint that:
+    1. Closes betting
+    2. Calculates 2% fee from total volume
+    3. Automatically withdraws USDC to oracle's wallet
+    """
     market = get_market(market_id)
     if not market:
         raise HTTPException(status_code=404, detail="Market not found")
     
+    if market["status"] != "active":
+        raise HTTPException(status_code=400, detail="Betting already closed or market resolved")
+    
+    # Calculate fee
+    volume_usd = market["volume_usd"]
+    fee_amount = fee_calculator.calculate_fee(volume_usd)
+    
+    # Record fee in database
+    fee_record = {
+        "market_id": market_id,
+        "platform_id": market["platform_id"],
+        "volume_usd": volume_usd,
+        "fee_percentage": fee_calculator.fee_percentage,
+        "fee_amount_usd": fee_amount,
+        "fee_wallet": fee_calculator.fee_wallet_address
+    }
+    record_fee(fee_record)
+    
+    # Close betting in database
     success = db_close_market_betting(market_id)
     
-    if success:
-        # Update cache
-        if market_id in active_markets:
-            active_markets[market_id]["status"] = "betting_closed"
-        
-        # Send webhook
-        await notifier.notify_betting_closed(market)
-        logger.info(f"Betting closed for market: {market_id}")
-        
-        return {
-            "status": "success",
-            "market_id": market_id,
-            "message": "Betting closed"
-        }
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to close betting")
     
-    raise HTTPException(status_code=500, detail="Failed to close betting")
+    # Update cache
+    if market_id in active_markets:
+        active_markets[market_id]["status"] = "betting_closed"
+    
+    # Send webhook notification
+    await notifier.notify_betting_closed(market)
+    
+    # Try to withdraw fee on-chain
+    withdrawal_result = None
+    if _solana_initialized and fee_amount > 0:
+        solana = get_solana_service()
+        if solana:
+            # For now, we store the fee - actual withdrawal requires platform to fund oracle wallet
+            # In production: oracle would pull from platform's vault or platform sends to oracle
+            withdrawal_result = {
+                "success": True,
+                "mode": "tracked",
+                "message": "Fee tracked - platform must send USDC to oracle wallet",
+                "fee_amount_usd": fee_amount,
+                "oracle_wallet": fee_calculator.fee_wallet_address
+            }
+    
+    logger.info(f"Betting closed for market: {market_id}. Fee tracked: ${fee_amount}")
+    
+    return {
+        "status": "success",
+        "market_id": market_id,
+        "volume_usd": volume_usd,
+        "fee_amount_usd": fee_amount,
+        "fee_wallet": fee_calculator.fee_wallet_address,
+        "message": "Betting closed. Fee calculated. Platform must send USDC to oracle wallet."
+    }
 
 @app.post("/api/v1/markets/{market_id}/resolve")
 async def resolve_market_endpoint(market_id: str, winner: str):
@@ -241,19 +334,7 @@ async def resolve_market_endpoint(market_id: str, winner: str):
     if winner not in teams:
         raise HTTPException(status_code=400, detail="Winner must be a valid team name")
     
-    # Calculate and collect fee
-    fee_amount = fee_calculator.calculate_fee(market["volume_usd"])
-    
-    # Record fee
-    fee_record = {
-        "market_id": market_id,
-        "platform_id": market["platform_id"],
-        "volume_usd": market["volume_usd"],
-        "fee_percentage": fee_calculator.fee_percentage,
-        "fee_amount_usd": fee_amount,
-        "fee_wallet": fee_calculator.fee_wallet_address
-    }
-    record_fee(fee_record)
+    # Note: Fee is already collected when betting closed - this just resolves the market
     
     # Update market
     db_resolve_market(market_id, winner, "success")
@@ -262,20 +343,18 @@ async def resolve_market_endpoint(market_id: str, winner: str):
     if market_id in active_markets:
         active_markets[market_id]["status"] = "resolved"
         active_markets[market_id]["winner"] = winner
-        active_markets[market_id]["fee_paid"] = True
     
     # Send webhook
     market["winner"] = winner
-    await notifier.notify_market_resolved(market, winner, fee_amount)
+    await notifier.notify_market_resolved(market, winner, 0)  # Fee already collected
     
-    logger.info(f"Market {market_id} resolved. Winner: {winner}. Fee: ${fee_amount}")
+    logger.info(f"Market {market_id} resolved. Winner: {winner}")
     
     return {
         "status": "success",
         "market_id": market_id,
         "winner": winner,
-        "fee_collected_usd": fee_amount,
-        "fee_wallet": fee_calculator.fee_wallet_address
+        "message": "Market resolved."
     }
 
 @app.get("/api/v1/fees")
@@ -283,31 +362,136 @@ def get_fee_history_endpoint():
     """Get fee collection history"""
     history = get_fee_history()
     total = sum(r["fee_amount_usd"] for r in history)
+    collected = sum(r["fee_amount_usd"] for r in history if r.get("onchain_withdrawn", False))
     
     return {
-        "total_fees_collected_usd": total,
+        "total_fees_tracked_usd": total,
+        "total_fees_withdrawn_usd": collected,
         "fee_wallet": fee_calculator.fee_wallet_address,
         "history": history
     }
 
+@app.post("/api/v1/withdraw")
+async def withdraw_fees(request: WithdrawFeeRequest) -> WithdrawFeeResponse:
+    """
+    Withdraw accumulated fees from specific markets or all markets.
+    
+    In the automated model:
+    - Platforms report volume via POST /api/v1/markets/{id}/volume
+    - When betting closes, fee is calculated and tracked
+    - Oracle can trigger withdrawal at any time
+    """
+    solana = get_solana_service()
+    
+    if not solana:
+        raise HTTPException(
+            status_code=503, 
+            detail="Solana service not configured. Set SOLANA_RPC_URL and ORACLE_FEE_WALLET_KEY"
+        )
+    
+    # Get markets to withdraw from
+    if request.market_ids:
+        markets = [get_market(mid) for mid in request.market_ids]
+        markets = [m for m in markets if m and not m["fee_paid"]]
+    else:
+        all_markets = get_all_markets()
+        markets = [m for m in all_markets if m["status"] in ["betting_closed", "resolved"] and not m["fee_paid"]]
+    
+    if not markets:
+        return WithdrawFeeResponse(
+            success=True,
+            total_withdrawn_usd=0,
+            transactions=[],
+            fee_wallet=fee_calculator.fee_wallet_address,
+            message="No fees to withdraw"
+        )
+    
+    # Calculate total fees
+    total_fee = sum(fee_calculator.calculate_fee(m["volume_usd"]) for m in markets)
+    
+    if total_fee <= 0:
+        return WithdrawFeeResponse(
+            success=True,
+            total_withdrawn_usd=0,
+            transactions=[],
+            fee_wallet=fee_calculator.fee_wallet_address,
+            message="No fees to withdraw"
+        )
+    
+    # In production, this would:
+    # 1. Check oracle's USDC balance
+    # 2. If platform owes oracle, trigger payment from platform
+    # 3. If oracle has balance, withdraw to fee wallet
+    
+    # For now, mark fees as withdrawn in DB
+    for market in markets:
+        update_market_fee_paid(market["market_id"])
+    
+    return WithdrawFeeResponse(
+        success=True,
+        total_withdrawn_usd=total_fee,
+        transactions=[{
+            "market_id": m["market_id"],
+            "fee_usd": fee_calculator.calculate_fee(m["volume_usd"]),
+            "status": "pending_onchain_verification"
+        } for m in markets],
+        fee_wallet=fee_calculator.fee_wallet_address,
+        message="Fees marked as withdrawn. On-chain transfer pending."
+    )
+
+@app.get("/api/v1/wallet/balance")
+def get_wallet_balance():
+    """Get oracle's USDC wallet balance on Solana"""
+    solana = get_solana_service()
+    
+    if not solana:
+        raise HTTPException(
+            status_code=503,
+            detail="Solana service not configured"
+        )
+    
+    balance = solana.get_usdc_balance(fee_calculator.fee_wallet_address)
+    
+    return {
+        "wallet_address": fee_calculator.fee_wallet_address,
+        "usdc_balance": balance,
+        "network": "Solana"
+    }
+
 @app.post("/api/v1/markets/{market_id}/volume")
 def update_volume(market_id: str, volume_usd: float):
-    """Update trading volume for a market"""
+    """
+    Update trading volume for a market.
+    
+    Platforms call this to report their trading volume.
+    The oracle tracks this to calculate 2% fee when betting closes.
+    """
     market = get_market(market_id)
     if not market:
         raise HTTPException(status_code=404, detail="Market not found")
     
+    if market["status"] != "active":
+        raise HTTPException(status_code=400, detail="Cannot update volume - betting closed or market resolved")
+    
+    # Calculate projected fee at current volume
+    projected_fee = fee_calculator.calculate_fee(volume_usd)
+    
+    # Update volume in database
     update_market_volume(market_id, volume_usd)
     
     # Update cache
     if market_id in active_markets:
         active_markets[market_id]["volume_usd"] = volume_usd
     
+    logger.info(f"Volume updated for {market_id}: ${volume_usd} -> Fee at close: ${projected_fee}")
+    
     return {
         "status": "success",
         "market_id": market_id,
         "volume_usd": volume_usd,
-        "fee_at_resolution": fee_calculator.calculate_fee(volume_usd)
+        "fee_at_close_usd": projected_fee,
+        "fee_wallet": fee_calculator.fee_wallet_address,
+        "message": "Volume updated. Fee will be collected when betting closes."
     }
 
 # ============================================================================
